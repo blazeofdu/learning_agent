@@ -1,12 +1,10 @@
 import json
 import logging
-import os
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
 from uuid import uuid4
 import asyncio
-
-from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     File,
@@ -16,60 +14,77 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import JSONResponse
-from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 from agent import run_agent
+from llm import ModelServiceError, create_sync_chat_completion
 from database import (
     get_messages,
     init_db,
     save_chat_exchange,
 )
+logger = logging.getLogger("uvicorn.error")
 
 
-# 读取 .env 文件
-load_dotenv()
-
-
-# 配置模型客户端
-client_config = {
-    "api_key": os.getenv("OPENAI_API_KEY"),
-}
-
-base_url = os.getenv("OPENAI_BASE_URL")
-
-if base_url:
-    client_config["base_url"] = base_url
-
-client = OpenAI(**client_config)
-
-MODEL = os.getenv("MODEL")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await run_in_threadpool(init_db)
+    yield
 
 
 # 创建 FastAPI 应用
 app = FastAPI(
-    title="AI Agent Learning API"
+    title="AI Agent Learning API",
+    lifespan=lifespan,
 )
 
 
-# 创建日志对象
-logger = logging.getLogger("uvicorn.error")
-
-
-# 初始化数据库
-init_db()
-
-
 class ChatRequest(BaseModel):
-    message: str
-    # session_id: Optional[str] = None
+    message: str = Field(min_length=1, max_length=10_000, pattern=r"\S")
 
 
 
 class ResumeRequest(BaseModel):
-    resume: str
+    resume: str = Field(min_length=1, max_length=20_000, pattern=r"\S")
 
 
+@app.exception_handler(ModelServiceError)
+async def model_exception_handler(request: Request, exc: ModelServiceError):
+    logger.warning("模型请求失败：path=%s, status=%s", request.url.path, exc.status_code)
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+
+
+@app.middleware("http") #所有的http都会先访问这个接口
+async def request_logging_middleware(
+        request: Request,
+        call_next
+):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request) #访问应该访问的接口
+    except Exception:
+        duration_ms = (time.perf_counter() - start)*1000
+        logger.error(
+            "请求处理失败：method=%s, path=%s, duration_ms=%.2f",
+            request.method,
+            request.url.path,
+            duration_ms,
+        )
+        raise
+    duration_ms = (time.perf_counter() - start) * 1000
+
+    logger.info(
+        "请求完成：method=%s, path=%s, status=%s, duration_ms=%.2f",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+
+    return response
 @app.get("/async_test") #测试并发
 async def async_test():
     await asyncio.sleep(3)
@@ -84,12 +99,17 @@ def global_exception_handler(
     request: Request,
     exc: Exception,
 ):
-    logger.exception(
-        "未处理的服务器异常：method=%s, path=%s",
+    logger.error( #把服务器中没有被处理的异常记录到日志里，并附带完整的错误堆栈。
+        "未处理的服务器异常：method=%s, path=%s, error=%s",
         request.method,
         request.url.path,
+        exc,
+        exc_info=(
+            type(exc), #异常类型
+             exc, #异常
+            exc.__traceback__, #异常的追踪信息，记录错误发生在哪个文件、哪一行、经过了哪些函数。
+        ),
     )
-
     return JSONResponse(
         status_code=500,
         content={
@@ -135,7 +155,8 @@ async def chat(
 
     answer = await run_agent(request.message)
 
-    save_chat_exchange(
+    await run_in_threadpool(
+        save_chat_exchange,
         session_id=session_id,
         user_message=request.message,
         assistant_message=answer,
@@ -179,8 +200,7 @@ def analyze_resume(request: ResumeRequest):
 }}
 """
 
-    response = client.chat.completions.create(
-        model=MODEL,
+    response = create_sync_chat_completion(
         messages=[
             {
                 "role": "system",
@@ -194,6 +214,8 @@ def analyze_resume(request: ResumeRequest):
         temperature=0,
     )
 
+    if not response.choices:
+        raise ModelServiceError("模型服务返回了空响应")
     content = response.choices[0].message.content or ""
 
     try:
@@ -229,7 +251,12 @@ async def upload_file(
             detail="目前只支持 TXT 和 Markdown 文件",
         )
 
-    content = await file.read()
+    # 最多读取上限 + 1 字节即可判断超限，避免一次读入整个大文件。
+    # multipart 解析层可能已经接收文件；公网部署还需要网关请求体限制。
+    try:
+        content = await file.read(1_000_001)
+    finally:
+        await file.close()
 
     if len(content) > 1_000_000:
         raise HTTPException(

@@ -4,4 +4,12 @@ __pycache__/
 .idea/
 .git/
 .env
+.env.*
 *.db
+data/
+.pytest_cache/
+.coverage*
+htmlcov/
+coverage.xml
+tests/
+*.ipynb

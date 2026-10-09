@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 .idea/
 .env
+.env.*
+!.env.example
 *.db
 .pytest_cache/
 .DS_Store
+data/
+.coverage*
+htmlcov/
+coverage.xml
+.ruff_cache/

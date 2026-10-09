@@ -1,13 +1,18 @@
+import os
 import sqlite3
 from pathlib import Path
 from contextlib import contextmanager
-from IPython.core.completer import context_matcher
-from decorator import contextmanager
 
-DATABASE_PATH = Path(__file__).with_name("agent.db") #当前这个文件的路径转化成字符串，并将文件后缀改成”“中的内容
+
+
+DATA_DIR = Path(__file__).with_name("data")#获取与database.py同级的data目录：
+# 测试或演示可设置独立路径；默认继续使用原有数据库。
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH") or DATA_DIR / "agent.db")
+
 
 @contextmanager #@contextmanager 让普通函数可以管理 with 代码块进入前和退出后的操作。配合yiedld
 def get_connection(): # FastAPI 会同时处理多个请求，而数据库连接本身带有事务状态。所有请求共享一个全局连接容易互相干扰。
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH)
 
     # 让查询结果不仅能用数字下标读取，也能用数据库字段名读取
@@ -101,4 +106,4 @@ def get_messages(session_id: str):
         return [dict(row) for row in rows] # row 转换成字典再返回
 
 
-init_db()
+# 导入模块不创建数据库，由应用启动时调用 init_db()。
